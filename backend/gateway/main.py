@@ -117,6 +117,9 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS (FR-03.1 — dashboard served from different origin)
+
+print("CORS ORIGINS:", settings.app_cors_origins)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.app_cors_origins,
