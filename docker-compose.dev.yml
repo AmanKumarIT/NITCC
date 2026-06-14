@@ -1,0 +1,319 @@
+version: "3.9"
+
+# =============================================================================
+# NITCC Local Development Environment
+# Starts all infrastructure services needed for local development
+# Note: MongoDB is provided via Atlas — configure MONGODB_URI in .env
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Apache Kafka (Message Bus — Inter-Agent Communication)
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: nitcc-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    networks:
+      - nitcc-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: nitcc-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - nitcc-net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # Confluent Schema Registry (Avro schema management)
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: nitcc-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    networks:
+      - nitcc-net
+
+  # Kafka UI for development visibility
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: nitcc-kafka-ui
+    depends_on:
+      - kafka
+      - schema-registry
+    ports:
+      - "8082:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: nitcc-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+    networks:
+      - nitcc-net
+
+  # Kafka topic initialization
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: nitcc-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - nitcc-net
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      echo 'Waiting for Kafka...'
+      sleep 10
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic nitcc.railway.events --partitions 6 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic nitcc.weather.events --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic nitcc.satellite.events --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic nitcc.logistics.events --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic nitcc.emergency.events --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic nitcc.orchestrator.events --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic nitcc.alerts --partitions 6 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic nitcc.dead-letter --partitions 1 --replication-factor 1
+      echo 'Kafka topics created.'
+      "
+
+  # ---------------------------------------------------------------------------
+  # Redis (Agent Shared State + Alert Deduplication)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: nitcc-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    networks:
+      - nitcc-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # ELK Stack (Centralized Structured Logging)
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: nitcc-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - nitcc-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: nitcc-kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    networks:
+      - nitcc-net
+
+  # ---------------------------------------------------------------------------
+  # Prometheus + Grafana (Metrics & Dashboards)
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: nitcc-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--storage.tsdb.retention.time=90d"
+    networks:
+      - nitcc-net
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: nitcc-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - nitcc-net
+
+  # ---------------------------------------------------------------------------
+  # Apache Airflow (ETL Pipeline Scheduler)
+  # ---------------------------------------------------------------------------
+  airflow-db:
+    image: postgres:15-alpine
+    container_name: nitcc-airflow-db
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    networks:
+      - nitcc-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    image: apache/airflow:2.8.0
+    container_name: nitcc-airflow-init
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    command: version
+    networks:
+      - nitcc-net
+
+  airflow-webserver:
+    image: apache/airflow:2.8.0
+    container_name: nitcc-airflow-webserver
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    command: webserver
+    networks:
+      - nitcc-net
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.0
+    container_name: nitcc-airflow-scheduler
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    command: scheduler
+    networks:
+      - nitcc-net
+
+  # ---------------------------------------------------------------------------
+  # MLflow (ML Model Tracking & Registry)
+  # ---------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    container_name: nitcc-mlflow
+    ports:
+      - "5000:5000"
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow_data:/mlflow
+    networks:
+      - nitcc-net
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  zookeeper_data:
+  zookeeper_logs:
+  kafka_data:
+  redis_data:
+  elasticsearch_data:
+  prometheus_data:
+  grafana_data:
+  airflow_db_data:
+  airflow_logs:
+  mlflow_data:
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  nitcc-net:
+    driver: bridge
