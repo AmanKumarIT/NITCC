@@ -27,10 +27,18 @@ export default defineConfig({
     sourcemap: true,
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom', 'react-router-dom'],
-          mapbox: ['mapbox-gl'],
-          charts: ['recharts'],
+        manualChunks(id) {
+          if (id.includes('mapbox-gl')) {
+            return 'mapbox'
+          }
+        
+          if (id.includes('recharts')) {
+            return 'charts'
+          }
+        
+          if (id.includes('node_modules')) {
+            return 'vendor'
+          }
         },
       },
     },
