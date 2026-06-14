@@ -16,18 +16,18 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for layer caching
-COPY backend/requirements.txt .
+COPY requirements.txt .
 
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
 # Copy backend code
-COPY backend/ .
+COPY . .
 
 # Install shared package
 RUN pip install -e shared/
 
-EXPOSE 8000
+EXPOSE 10000
 
 # Default command (Gateway)
-CMD ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "10000"]
